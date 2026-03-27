@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Email Guesser</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; }
+    .mono { font-family: ui-monospace, 'Cascadia Code', monospace; }
+    #log::-webkit-scrollbar { width: 4px; }
+    #log::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+  <div class="max-w-2xl mx-auto px-6 py-12">
+
+    <!-- Header -->
+    <div class="mb-10">
+      <h1 class="text-xl font-semibold tracking-tight">B2B Email Guesser</h1>
+      <p class="text-gray-500 text-sm mt-1">Taiwan-focused &middot; No paid APIs</p>
+    </div>
+
+    <!-- Form -->
+    <form id="form" class="space-y-3 mb-8">
+      <div class="flex gap-3">
+        <input id="name" type="text" placeholder="Name  (e.g. 陳美玲 or Kevin Chen)"
+          class="flex-1 mono bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-sm
+                 placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-colors" required />
+        <input id="url" type="text" placeholder="Company URL"
+          class="flex-1 mono bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-sm
+                 placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-colors" required />
+      </div>
+      <button id="btn" type="submit"
+        class="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed
+               rounded-lg py-2.5 text-sm font-medium transition-colors flex items-center justify-center gap-2">
+        <span id="btn-label">Run</span>
+        <svg id="spinner" class="hidden animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+        </svg>
+      </button>
+    </form>
+
+    <!-- Loading -->
+    <div id="loading" class="hidden mb-6 text-sm text-gray-500 text-center py-6">
+      Searching &amp; verifying — this can take up to a minute…
+    </div>
+
+    <!-- Results -->
+    <div id="results-section" class="hidden">
+      <p class="text-xs text-gray-500 uppercase tracking-widest mb-2">Results</p>
+
+      <!-- Overall verdict -->
+      <div id="verdict" class="rounded-lg px-4 py-3 mb-4 text-sm font-medium"></div>
+
+      <!-- Sub-checks -->
+      <div class="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 mb-4 text-xs space-y-2">
+        <div class="flex gap-6 flex-wrap">
+          <span class="text-gray-500">Email Format   <span class="ml-1 text-green-400">✓ Valid</span></span>
+          <span id="chk-domain"  class="text-gray-500">Domain Status  <span class="ml-1"></span></span>
+          <span class="text-gray-500">Disposable     <span class="ml-1 text-green-400">✓ No</span></span>
+          <span id="chk-meta"    class="text-gray-500"></span>
+        </div>
+      </div>
+
+      <!-- Table -->
+      <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-gray-800 text-xs text-gray-500 uppercase tracking-wider">
+              <th class="text-left px-4 py-3 font-normal w-8">#</th>
+              <th class="text-left px-4 py-3 font-normal">Email</th>
+              <th class="text-right px-4 py-3 font-normal">Deliverability</th>
+            </tr>
+          </thead>
+          <tbody id="results-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const form          = document.getElementById('form');
+    const btn           = document.getElementById('btn');
+    const btnLabel      = document.getElementById('btn-label');
+    const spinner       = document.getElementById('spinner');
+    const logEl         = document.getElementById('log');
+    const logSection    = document.getElementById('log-section');
+    const resultsSection= document.getElementById('results-section');
+    const resultsBody   = document.getElementById('results-body');
+    const loadingEl     = document.getElementById('loading');
+    const verdictEl     = document.getElementById('verdict');
+    const chkDomain     = document.getElementById('chk-domain');
+    const chkMeta       = document.getElementById('chk-meta');
+
+    const STATUS = {
+      valid:   'bg-green-900/60 text-green-300 border border-green-700/50',
+      invalid: 'bg-red-900/30  text-red-400   border border-red-800/40',
+      default: 'bg-gray-800    text-gray-400   border border-gray-700',
+    };
+
+    function pill(label, style) {
+      return `<span class="px-2.5 py-1 rounded-full ${style}">${label}</span>`;
+    }
+
+    function statusClass(s) {
+      if (s === 'valid') return STATUS.valid;
+      if (s === 'invalid') return STATUS.invalid;
+      return STATUS.default;
+    }
+
+    function setRunning(on) {
+      btn.disabled = on;
+      btnLabel.textContent = on ? 'Running…' : 'Run';
+      spinner.classList.toggle('hidden', !on);
+    }
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+
+      // Reset UI
+      resultsBody.innerHTML = '';
+      verdictEl.textContent = '';
+      verdictEl.className = 'rounded-lg px-4 py-3 mb-4 text-sm font-medium';
+      loadingEl.classList.remove('hidden');
+      resultsSection.classList.add('hidden');
+      setRunning(true);
+
+      const name = document.getElementById('name').value.trim();
+      const url  = document.getElementById('url').value.trim();
+
+      fetch('/run', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ name, url }),
+      })
+        .then(r => r.json())
+        .then(data => {
+          loadingEl.classList.add('hidden');
+          setRunning(false);
+          if (data.error) { alert('Error: ' + data.error); return; }
+          renderResults(data);
+        })
+        .catch(err => {
+          loadingEl.classList.add('hidden');
+          setRunning(false);
+          alert('Request failed: ' + err);
+        });
+    });
+
+    function renderResults(r) {
+      resultsSection.classList.remove('hidden');
+
+      // Overall verdict
+      const validEmails = r.candidates.filter(([,s]) => s === 'valid');
+      const mxOk = r.catch_all !== null;
+      let verdictText, verdictCls;
+      if (validEmails.length) {
+        verdictText = `✓  Valid address found`;
+        verdictCls  = 'bg-green-900/30 border border-green-700/50 text-green-300';
+      } else if (r.catch_all === true) {
+        verdictText = `⚠  Catch-all domain — deliverability unconfirmed`;
+        verdictCls  = 'bg-yellow-900/30 border border-yellow-700/50 text-yellow-400';
+      } else if (!mxOk) {
+        verdictText = `✗  Domain has no MX records — email not deliverable`;
+        verdictCls  = 'bg-red-900/20 border border-red-800/40 text-red-400';
+      } else {
+        verdictText = `✗  No valid address found`;
+        verdictCls  = 'bg-red-900/20 border border-red-800/40 text-red-400';
+      }
+      verdictEl.textContent = verdictText;
+      verdictEl.className  += ' ' + verdictCls;
+
+      // Sub-checks
+      const domainSpan = chkDomain.querySelector('span');
+      if (mxOk) {
+        domainSpan.textContent = `✓ Valid  (${r.domain})`;
+        domainSpan.className   = 'ml-1 text-green-400';
+      } else {
+        domainSpan.textContent = '✗ No MX records';
+        domainSpan.className   = 'ml-1 text-red-400';
+      }
+      chkMeta.innerHTML = `pattern: <span class="text-gray-300">${r.pattern || 'unknown'}</span>` +
+        (r.found_wild.length ? `&ensp;·&ensp;<span class="text-blue-400">${r.found_wild.length} found in wild</span>` : '');
+
+      // Rows
+      r.candidates.forEach(([email, status], i) => {
+        const isValid = status === 'valid';
+        const tr = document.createElement('tr');
+        tr.className = 'border-b border-gray-800/60 last:border-0 ' + (isValid ? 'bg-green-900/10' : 'hover:bg-gray-800/40');
+        tr.innerHTML = `
+          <td class="px-4 py-3 text-gray-600 mono text-xs">${i + 1}</td>
+          <td class="px-4 py-3 mono text-sm ${isValid ? 'text-green-300 font-medium' : 'text-gray-300'}">${email}</td>
+          <td class="px-4 py-3 text-right">
+            <span class="text-xs px-2.5 py-1 rounded-full ${statusClass(status)}">${status}</span>
+          </td>`;
+        resultsBody.appendChild(tr);
+      });
+    }
+  </script>
+</body>
+</html>
