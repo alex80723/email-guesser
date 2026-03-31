@@ -20,13 +20,16 @@ import sys
 import time
 import logging
 import os
+import socket
 import smtplib
 import requests
 import urllib3
 import dns.resolver
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-from collections import deque
+from collections import deque, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from pypinyin import lazy_pinyin, Style
@@ -200,6 +203,7 @@ def romanize_chinese_name(name: str) -> list[tuple[str, str]]:
     tw = [pinyin_to_wade_giles(p) for p in pinyin]
 
     variants: list[tuple[str, str]] = []
+    _seen_variants: set[tuple[str, str]] = set()
 
     def add(given_chars_indices: list[int], last_chars_indices: list[int]):
         """Enumerate all (first, last) combos from TW-variant lists."""
@@ -241,7 +245,8 @@ def romanize_chinese_name(name: str) -> list[tuple[str, str]]:
         for last in last_options:
             for first in given_options:
                 v = (first, last)
-                if v not in variants:
+                if v not in _seen_variants:
+                    _seen_variants.add(v)
                     variants.append(v)
 
     def _cartesian_join(syllable_lists: list[list[str]]) -> list[str]:
@@ -338,10 +343,11 @@ HEADERS = {
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 
-_EMAIL_RE     = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-_EMAIL_RE_DOM = lambda domain: re.compile(
-    rf"[a-zA-Z0-9._%+\-]+@{re.escape(domain)}", re.IGNORECASE
-)
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+@lru_cache(maxsize=16)
+def _email_re_for_domain(domain: str) -> re.Pattern:
+    return re.compile(rf"[a-zA-Z0-9._%+\-]+@{re.escape(domain)}", re.IGNORECASE)
 
 
 _PLACEHOLDER_LOCAL_PARTS = {
@@ -360,7 +366,7 @@ def extract_all_emails(text: str) -> list[str]:
 
 
 def extract_emails_for_domain(text: str, domain: str) -> list[str]:
-    return [m.lower() for m in _EMAIL_RE_DOM(domain).findall(text)]
+    return [m.lower() for m in _email_re_for_domain(domain).findall(text)]
 
 
 _JUNK_DOMAINS = {
@@ -379,7 +385,6 @@ def detect_email_domain(website_domain: str, all_emails: list[str]) -> str:
     Falls back to the website domain if no clear signal.
     Excludes freemail, placeholder domains, and placeholder local parts.
     """
-    from collections import Counter
     real_emails = [
         e for e in all_emails
         if "@" in e
@@ -417,12 +422,15 @@ def scrape_company_website(website_domain: str) -> tuple[list[str], str]:
     1. Checks priority paths first.
     2. From the homepage, extracts all internal links and adds them to the queue.
     3. Stops after visiting MAX_PAGES pages or once emails are found.
+    4. Fetches pages in concurrent batches (MAX_WORKERS) with polite rate-limiting.
 
     Returns (found_emails_for_email_domain, detected_email_domain).
     """
     MAX_PAGES = 35
+    MAX_WORKERS = 5
     all_found_emails: list[str] = []
     visited: set[str] = set()
+    queued: set[str] = set()
     queue: deque[str] = deque()
 
     # Some domains only resolve with www. prefix — detect and use it
@@ -433,44 +441,60 @@ def scrape_company_website(website_domain: str) -> tuple[list[str], str]:
         base = bare_base
     except Exception:
         base = www_base
+
     for path in _PRIORITY_PATHS:
-        queue.append(base + path)
+        url = base + path
+        if url not in queued:
+            queue.append(url)
+            queued.add(url)
 
     homepage_crawled = False
 
-    while queue and len(visited) < MAX_PAGES:
-        url = queue.popleft()
-        if url in visited:
-            continue
-        visited.add(url)
-
+    def _fetch(url: str):
         try:
             r = requests.get(url, headers=HEADERS, timeout=8, allow_redirects=True, verify=False)
             logger.debug(f"  GET {url} → {r.status_code}")
-            if r.status_code != 200:
-                time.sleep(0.2)
-                continue
-
-            emails = extract_all_emails(r.text)
-            if emails:
-                logger.debug(f"    emails found: {emails}")
-            all_found_emails.extend(emails)
-
-            # Expand BFS from homepage only (to avoid crawling the whole site)
-            if not homepage_crawled and url in (base, base + "/", base + "/index.html"):
-                homepage_crawled = True
-                soup = BeautifulSoup(r.text, "html.parser")
-                for a in soup.find_all("a", href=True):
-                    href = a["href"].strip()
-                    if href.startswith("/"):
-                        full = base + href
-                        if full not in visited:
-                            queue.append(full)
-
-            time.sleep(0.3)
+            return url, r
         except Exception as e:
             logger.debug(f"  ERROR {url} → {e}")
-            continue
+            return url, None
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        while queue and len(visited) < MAX_PAGES:
+            # Build a batch of URLs to fetch concurrently
+            batch: list[str] = []
+            while queue and len(batch) < MAX_WORKERS and len(visited) + len(batch) < MAX_PAGES:
+                url = queue.popleft()
+                if url not in visited:
+                    batch.append(url)
+                    visited.add(url)
+
+            if not batch:
+                break
+
+            for future in as_completed(pool.submit(_fetch, u) for u in batch):
+                url, r = future.result()
+                if r is None or r.status_code != 200:
+                    continue
+
+                emails = extract_all_emails(r.text)
+                if emails:
+                    logger.debug(f"    emails found: {emails}")
+                all_found_emails.extend(emails)
+
+                # Expand BFS from homepage only (to avoid crawling the whole site)
+                if not homepage_crawled and url in (base, base + "/", base + "/index.html"):
+                    homepage_crawled = True
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    for a in soup.find_all("a", href=True):
+                        href = a["href"].strip()
+                        if href.startswith("/"):
+                            full = base + href
+                            if full not in visited and full not in queued:
+                                queue.append(full)
+                                queued.add(full)
+
+            time.sleep(0.3)  # polite rate-limit per batch
 
     email_domain = detect_email_domain(website_domain, all_found_emails)
     domain_emails = [e for e in all_found_emails if e.split("@")[1] == email_domain]
@@ -539,17 +563,24 @@ def search_1111(company_hint: str, email_domain: str) -> list[str]:
     return list(set(found))
 
 
+_PAT_FIRST_LAST = re.compile(r"[a-z]+\.[a-z]+")
+_PAT_FIRST_USCR = re.compile(r"[a-z]+_[a-z]+")
+_PAT_F_LAST     = re.compile(r"[a-z]\.[a-z]+")
+_PAT_FIRSTLAST  = re.compile(r"[a-z][a-z]{2,}")
+_PAT_FIRST_L    = re.compile(r"[a-z]+\.[a-z]")
+
+
 def infer_pattern(emails: list[str]) -> str | None:
     if not emails:
         return None
     counts: dict[str, int] = {}
     for email in emails:
         local = email.split("@")[0]
-        if re.fullmatch(r"[a-z]+\.[a-z]+",  local): counts["first.last"] = counts.get("first.last", 0) + 1
-        if re.fullmatch(r"[a-z]+_[a-z]+",   local): counts["first_last"] = counts.get("first_last", 0) + 1
-        if re.fullmatch(r"[a-z]\.[a-z]+",   local): counts["f.last"]     = counts.get("f.last",     0) + 1
-        if re.fullmatch(r"[a-z][a-z]{2,}",  local): counts["firstlast"]  = counts.get("firstlast",  0) + 1
-        if re.fullmatch(r"[a-z]+\.[a-z]",   local): counts["first.l"]    = counts.get("first.l",    0) + 1
+        if _PAT_FIRST_LAST.fullmatch(local): counts["first.last"] = counts.get("first.last", 0) + 1
+        if _PAT_FIRST_USCR.fullmatch(local): counts["first_last"] = counts.get("first_last", 0) + 1
+        if _PAT_F_LAST.fullmatch(local):     counts["f.last"]     = counts.get("f.last",     0) + 1
+        if _PAT_FIRSTLAST.fullmatch(local):  counts["firstlast"]  = counts.get("firstlast",  0) + 1
+        if _PAT_FIRST_L.fullmatch(local):    counts["first.l"]    = counts.get("first.l",    0) + 1
     if not counts:
         return None
     return max(counts, key=lambda k: counts[k])
@@ -645,7 +676,6 @@ def _smtp_code_to_status(code: int) -> str:
 
 def _get_ehlo_fqdn() -> str:
     """Return this machine's FQDN for honest EHLO identification."""
-    import socket
     fqdn = socket.getfqdn()
     # Fall back to something neutral if FQDN is localhost-ish
     if not fqdn or fqdn in ("localhost", "localhost.localdomain"):
